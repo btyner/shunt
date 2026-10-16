@@ -1,0 +1,12 @@
+{
+	"name": "omp-shunt",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Keep I/O-heavy work out of the main OMP context: gate large-file reads and delegate bulk reading / boilerplate generation to a cheaper one-shot worker model.",
+	"license": "Apache-2.0",
+	"keywords": ["omp", "token-optimization", "delegation"],
+	"omp": {
+		"extensions": ["./src/index.ts"]
+	}
+}

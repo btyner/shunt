@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shunt for OMP (GPT edition) — Saving Tokens by Keeping Bulk Work Out of Context</title>
+<style>
+  :root {
+    --bg: #1e1e2e; --panel: #262637; --text: #cdd6f4; --muted: #a6adc8;
+    --accent: #89b4fa; --green: #a6e3a1; --red: #f38ba8; --yellow: #f9e2af; --border: #3a3a52;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.65 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 900px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 2.2rem; margin: 0 0 4px; }
+  h1 + p.subtitle { color: var(--muted); margin-top: 0; font-size: 1.1rem; }
+  h2 { margin-top: 56px; padding-bottom: 6px; border-bottom: 1px solid var(--border); color: var(--accent); }
+  h3 { margin-top: 32px; }
+  a { color: var(--accent); }
+  code { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: .9em; background: var(--panel); padding: 1px 6px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: .95rem; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  nav.toc { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 24px; margin: 24px 0; }
+  nav.toc ol { margin: 8px 0; }
+  .callout { border-left: 4px solid var(--accent); background: var(--panel); padding: 12px 18px; border-radius: 0 8px 8px 0; margin: 20px 0; }
+  .callout.warn { border-color: var(--yellow); }
+  .callout.good { border-color: var(--green); }
+  .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 20px 0; }
+  .compare > div { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 18px; }
+  .compare h4 { margin: 0 0 8px; }
+  .bad h4 { color: var(--red); } .ok h4 { color: var(--green); }
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 20px 0; }
+  .flow span.step { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; }
+  .flow span.arrow { color: var(--muted); }
+  .bar { height: 22px; border-radius: 4px; margin: 4px 0 12px; }
+  .bar-label { font-size: .9rem; color: var(--muted); }
+  footer { margin-top: 64px; color: var(--muted); font-size: .9rem; border-top: 1px solid var(--border); padding-top: 16px; }
+  @media (max-width: 640px) { .compare { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+
+<h1>shunt for OMP</h1>
+<p class="subtitle">Keep I/O-heavy work out of your main agent's context, and let a cheaper model do the heavy reading and boilerplate writing.</p>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#intro">Introduction</a></li>
+    <li><a href="#install">Installation</a></li>
+    <li><a href="#problem">Where the tokens go</a></li>
+    <li><a href="#how">How shunt saves tokens</a></li>
+    <li><a href="#gate">Layer 1: the gate</a></li>
+    <li><a href="#bulk-read">Layer 2: <code>bulk_read</code></a></li>
+    <li><a href="#code-write">Layer 3: <code>code_write</code></a></li>
+    <li><a href="#roles">Choosing the worker model</a></li>
+    <li><a href="#subscription">ChatGPT subscription vs. API key</a></li>
+    <li><a href="#modes">Custom modes</a></li>
+    <li><a href="#when-not">When not to delegate</a></li>
+    <li><a href="#limits">Limitations</a></li>
+  </ol>
+</nav>
+
+<h2 id="intro">1. Introduction</h2>
+<p>
+  <strong>shunt</strong> is an extension for <a href="https://omp.sh">OMP</a>. It is a port of Spotify's
+  <a href="https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt">shunt plugin for Claude Code</a> (Apache-2.0).
+  The original sent work to Spotify's internal AiKA service through the Portal CLI. This version needs neither: it sends
+  delegated work to whatever cheaper model OMP is already logged in to. This edition assumes OpenAI GPT models, with
+  <strong>GPT-6 Luna</strong> as the worker.
+</p>
+<p>
+  The idea is simple. Your main model (for example GPT-6 Astra) is the most capable and the most expensive model you run, and
+  anything that enters its context window is paid for again <em>on every later turn</em>. Reading a 1,000-line file or
+  writing 150 lines of test boilerplate is mostly mechanical work, so it doesn't need that model. shunt hands those jobs to a cheaper worker
+  model and returns only the result: a concise answer, or a one-line "wrote the file" receipt.
+</p>
+<p>shunt adds three things to OMP:</p>
+<ul>
+  <li><strong>A gate:</strong> a hook that blocks full-file reads of large files and points the agent to a cheaper path.</li>
+  <li><strong><code>bulk_read</code>:</strong> a tool that asks a cheap model a question about files and returns only the answer.</li>
+  <li><strong><code>code_write</code>:</strong> a tool that has a cheap model generate a file from a spec and reference files, writes it to disk, and returns a receipt.</li>
+</ul>
+
+<h2 id="install">2. Installation</h2>
+<h3>Requirements</h3>
+<ul>
+  <li>OMP logged in to OpenAI. This guide assumes a ChatGPT subscription login, which OMP calls the
+      <code>openai-codex</code> provider. An API key (provider <code>openai</code>) also works; swap the prefix.</li>
+  <li><code>gpt-6-luna</code> available as the worker. Check with <code>omp models openai-codex</code>.</li>
+</ul>
+
+<h3>Install the plugin</h3>
+<p>Link the plugin directory so OMP loads it in every session:</p>
+<pre><code>omp plugin link /path/to/shunt</code></pre>
+<p>Or load it for one session only:</p>
+<pre><code>omp -e /path/to/shunt</code></pre>
+
+<h3>Point the worker at a cheap model</h3>
+<p>
+  shunt uses OMP's <code>smol</code> model role by default. Assign it in <code>~/.omp/agent/config.yml</code>:
+</p>
+<pre><code>modelRoles:
+  default: openai-codex/gpt-6-astra
+  smol: openai-codex/gpt-6-luna:low</code></pre>
+<p>A ChatGPT login currently offers these models in OMP:</p>
+<pre><code>$ omp models openai-codex
+gpt-5.6-luna  gpt-5.6-sol  gpt-5.6-terra
+gpt-6-astra   gpt-6-luna   gpt-6-sol   gpt-6.1-sol
+(all: 272K context, 128K max output, effort low|medium|high|xhigh|max)</code></pre>
+<div class="callout warn">
+  If <code>smol</code> is unset, it falls back to your <em>default</em> model. shunt then shows a warning at startup:
+  you still save context, but the worker runs on your expensive model and you lose the per-token savings.
+</div>
+
+<h3>Optional settings</h3>
+<table>
+  <tr><th>Environment variable</th><th>Default</th><th>Purpose</th></tr>
+  <tr><td><code>SHUNT_MIN_LINES</code></td><td><code>350</code></td><td>Files longer than this are blocked from full reads.</td></tr>
+  <tr><td><code>SHUNT_MODEL</code></td><td><code>@smol</code></td><td>Worker model or role alias. A mode's own <code>model:</code> setting overrides it.</td></tr>
+  <tr><td><code>SHUNT_TIMEOUT_SECONDS</code></td><td><code>180</code></td><td>Time limit for one worker call.</td></tr>
+</table>
+
+<h3>Check that it works</h3>
+<pre><code>cd /path/to/shunt
+SHUNT_MIN_LINES=50 omp -e .</code></pre>
+<p>
+  Ask: <em>"Read src/index.ts in full and explain it."</em> The <code>read</code> is blocked and the agent calls
+  <code>bulk_read</code> instead. The result ends with a footer like:
+</p>
+<pre><code>[shunt: bulk-reader via openai-codex/gpt-6-luna · 2326 in / 188 out tokens · $0.0003]</code></pre>
+<p class="bar-label">(Real output from a test run summarizing a 178-line file.)</p>
+
+<h2 id="problem">3. Where the tokens go</h2>
+<p>
+  An agent conversation is <strong>cumulative</strong>. Each turn re-sends the whole conversation so far, including
+  every file the agent has read and every piece of code it has written. Prompt caching lowers the price of those
+  repeated tokens, but they still take up context space and still count, and they stay there until compaction.
+</p>
+<p>Two habits get expensive quickly:</p>
+<ol>
+  <li><strong>Reading whole large files to answer a narrow question.</strong> The agent reads a 600-line file to learn
+      what it exports. The answer takes 15 lines, but the other 585 sit in context for the rest of the session.</li>
+  <li><strong>Writing boilerplate on the most expensive model.</strong> Output tokens cost the most, and a large model
+      writing 150 lines of predictable tests pays premium rates for mechanical work. That code then stays in context too.</li>
+</ol>
+
+<div class="callout">
+  <strong>Rule of thumb:</strong> a token that enters the main context costs main-model rates once, and then again (at
+  cache rates) on every later turn. A token that only the worker sees costs worker rates once.
+</div>
+
+<h2 id="how">4. How shunt saves tokens</h2>
+<div class="flow">
+  <span class="step">Main agent (GPT-6 Astra)</span><span class="arrow">→ asks question / spec →</span>
+  <span class="step">shunt tool</span><span class="arrow">→ files + prompt →</span>
+  <span class="step">Worker (GPT-6 Luna)</span><span class="arrow">→ answer / file →</span>
+  <span class="step">Main agent sees only the summary</span>
+</div>
+<h3>Price gap between the main model and the worker</h3>
+<p>OpenAI list prices per 1M tokens, from <a href="https://developers.openai.com/api/docs/models">OpenAI's model pages</a>:</p>
+<table>
+  <tr><th>Model</th><th>Input</th><th>Cached input</th><th>Output</th><th>Typical role</th></tr>
+  <tr><td><code>gpt-6-astra</code></td><td>$10.00</td><td>$1.00</td><td>$50.00</td><td>Main conversation</td></tr>
+  <tr><td><code>gpt-6.1-sol</code></td><td>$2.00</td><td>$0.10</td><td>$10.00</td><td>Subagents</td></tr>
+  <tr><td><code>gpt-6-luna</code></td><td>$0.10</td><td>$0.01</td><td>$0.50</td><td>shunt worker</td></tr>
+</table>
+<p>
+  Luna costs <strong>1/100th</strong> of Astra per token for both input and output. Every file read or file generated on
+  Luna instead of Astra costs about 1% as much, before counting the context savings. On a ChatGPT subscription these
+  prices aren't charged to you, but they're a fair guide to how much of your usage allowance each model uses.
+</p>
+<p>The three effects:</p>
+<table>
+  <tr><th>Effect</th><th>What happens</th><th>Why it saves</th></tr>
+  <tr><td><strong>Context isolation</strong></td><td>File contents go to the worker and never enter the main conversation.</td><td>The main model doesn't re-read those tokens on later turns.</td></tr>
+  <tr><td><strong>Cheaper per-token price</strong></td><td>The worker is a smaller model.</td><td>Reading and generation are billed at the smaller model's rates.</td></tr>
+  <tr><td><strong>Small results</strong></td><td>Only a concise answer or a one-line receipt comes back.</td><td>The main context grows by a few lines instead of hundreds.</td></tr>
+</table>
+
+<h3>Stateless one-shot calls</h3>
+<p>
+  Each worker call is independent: one request and one response, with no conversation history. To follow up, the
+  agent calls again with the same files. This sounds wasteful, but the re-sent files cost the cheap worker,
+  not the main agent's context.
+</p>
+
+<h2 id="gate">5. Layer 1: the gate</h2>
+<p>
+  On its own, an agent's habit is to read whole files, and an instruction to "please delegate" is often ignored. So shunt
+  uses a <strong>hook</strong> that inspects every <code>read</code> and <code>bash</code> call before it runs. A
+  full-file dump of a large text file is <em>blocked</em>, and the block message tells the agent what to do instead.
+</p>
+<pre><code>shunt: websocket-handler.ts is 602 lines (threshold 350). Don't pull it into context whole.
+To understand or summarize it, call bulk_read with your question and the paths — only the
+answer comes back. If you need exact text to edit, read only the range you need, e.g.
+websocket-handler.ts:1-200.</code></pre>
+
+<h3>What is blocked and what is allowed</h3>
+<table>
+  <tr><th>Call</th><th>Allowed</th><th>Blocked</th></tr>
+  <tr>
+    <td><code>read</code></td>
+    <td>Line ranges (<code>f:1-200</code>, <code>f:-60</code>), small files, binary or missing files, URLs, directories</td>
+    <td>A bare path (or bare <code>:raw</code>) to a text file over the threshold</td>
+  </tr>
+  <tr>
+    <td><code>bash</code></td>
+    <td>Anything piped or redirected (<code>cat f | grep x</code>), <code>head</code>/<code>tail</code> printing few lines, non-reading commands</td>
+    <td><code>cat</code>, <code>less</code>, <code>more</code> over the threshold; <code>head</code>/<code>tail</code> printing more than the threshold</td>
+  </tr>
+</table>
+<p>
+  Reading a line range is always allowed. An agent that needs exact text to make an edit can still get it, but only the
+  part it needs.
+</p>
+
+<h2 id="bulk-read">6. Layer 2: <code>bulk_read</code></h2>
+<p>
+  <code>bulk_read</code> takes a <strong>question</strong> and a list of <strong>paths</strong>. The worker reads the
+  files and answers with structured bullets. Only that answer returns to the main agent.
+</p>
+<div class="compare">
+  <div class="bad">
+    <h4>Without shunt</h4>
+    <p>The main agent reads a 602-line file. All 602 lines enter context and are re-sent on every later turn.</p>
+  </div>
+  <div class="ok">
+    <h4>With shunt</h4>
+    <p>Luna reads the 602 lines once at 1% of Astra's price. About 20 lines of answer enter the main context.</p>
+  </div>
+</div>
+<p><strong>Good uses:</strong> understanding large files, questions that span 3 or more files, summarizing long diffs or logs.</p>
+<p>
+  <strong>Verify before editing:</strong> worker answers are summaries. When the agent needs an exact line number or
+  value for an edit, it should confirm it with a ranged read.
+</p>
+
+<h2 id="code-write">7. Layer 3: <code>code_write</code></h2>
+<p>
+  <code>code_write</code> takes a <strong>spec</strong>, a list of <strong>reference files</strong>, and an optional
+  <strong>target</strong> path. The worker generates the code following the patterns in the references. If a target is
+  given, the code is written straight to disk and the main agent receives only:
+</p>
+<pre><code>Wrote gate.test.ts (99 lines). Review it with ranged reads.
+[shunt: code-writer via openai-codex/gpt-6-luna · 1795 in / 1038 out tokens · $0.0007]</code></pre>
+<p class="bar-label">(Real output from a test run generating unit tests for a 153-line source file.)</p>
+<p>That saves twice:</p>
+<ol>
+  <li><strong>The expensive model never generates the code.</strong> Output tokens are the priciest kind, and they are now billed at the worker's rate.</li>
+  <li><strong>The code never enters the main conversation.</strong> The main agent can spot-check it with ranged reads instead of carrying all of it.</li>
+</ol>
+<div class="callout warn">
+  If the main agent reads the whole generated file back afterwards, the second saving is lost (the first one remains). Spot-checks with ranged reads keep both.
+</div>
+<p><strong>Typical uses:</strong> unit tests that follow an existing test, fixtures and mock data, config files, type stubs, docstrings, and new routes, handlers or migrations that copy an existing pattern.</p>
+<p><strong>Safeguards:</strong> <code>references</code> is required, so the worker always has a pattern to match. Output cut off at the worker's length limit is never written to disk.</p>
+
+<h2 id="roles">8. Choosing the worker model</h2>
+<p>The worker model is chosen in this order, first match wins:</p>
+<ol>
+  <li>The <code>model:</code> line in the mode file being used</li>
+  <li>The <code>SHUNT_MODEL</code> environment variable</li>
+  <li>OMP's <code>@smol</code> role</li>
+</ol>
+<p>A layout of OMP model roles that fits shunt well:</p>
+<pre><code>modelRoles:
+  default: openai-codex/gpt-6-astra             # main conversation
+  slow:    openai-codex/gpt-6-astra:high        # deep reasoning, advisor
+  plan:    "@slow"                              # plan mode
+  task:    openai-codex/gpt-6.1-sol:medium      # subagents ("near-Astra performance at a lower cost")
+  smol:    openai-codex/gpt-6-luna:low          # shunt worker, cheap side jobs
+  commit:  openai-codex/gpt-6-luna:low          # commit messages
+  vision:  openai-codex/gpt-6.1-sol:low         # image questions</code></pre>
+<p>
+  Through a ChatGPT login, every model accepts <code>low</code>, <code>medium</code>, <code>high</code>,
+  <code>xhigh</code> and <code>max</code>. There is no <code>none</code> or <code>minimal</code>, so <code>low</code> is
+  the cheapest setting.
+</p>
+<div class="callout warn">
+  <strong>Reasoning tokens count as output.</strong> shunt doesn't send a reasoning level with its worker calls, so the
+  <code>:low</code> on <code>smol</code> only affects OMP's other uses of that role. The worker uses the model's own
+  default effort (<code>medium</code> for Luna, per OpenAI), and the reasoning tokens are counted as output.
+</div>
+<div class="callout">
+  <strong>Temperature is ignored on GPT models.</strong> OMP removes <code>temperature</code> from requests to GPT-5+
+  and Codex models because their APIs reject it. A mode's <code>temperature:</code> setting has no effect here.
+</div>
+
+<h2 id="subscription">9. ChatGPT subscription vs. API key</h2>
+<table>
+  <tr><th></th><th>ChatGPT Plus/Pro (<code>openai-codex/</code>)</th><th>API key (<code>openai/</code>)</th></tr>
+  <tr><td>What you save</td><td>Usage-limit headroom</td><td>Dollars per token</td></tr>
+  <tr><td>The <code>$</code> in the footer</td><td>Calculated from API list prices, so a rough measure of usage, not a charge</td><td>Close to what you are actually billed</td></tr>
+  <tr><td>Context window</td><td>272K by default; <code>/extended-context on</code> raises Astra and 6.1 Sol to 922K input</td><td>Up to 922K input</td></tr>
+  <tr><td>Biggest benefit</td><td>Fewer Astra tokens, so your flagship allowance lasts longer</td><td>Luna at 1% of Astra's rate, plus a smaller context</td></tr>
+</table>
+<p>
+  With a subscription, every call is counted against the same login: main turns, subagents, and shunt's worker calls.
+  Moving bulk reading and boilerplate from Astra to Luna stretches your limits much further.
+</p>
+<div class="callout">
+  The 272K window on a ChatGPT login makes context isolation matter more: every large file kept out of the main
+  conversation leaves room for real work and puts off compaction.
+</div>
+
+<h2 id="modes">10. Custom modes</h2>
+<p>
+  A <strong>mode</strong> is a named worker system prompt, with an optional model and temperature (ignored on GPT). Modes are what make
+  shunt useful for other workflows beyond code. There are two built-ins, <code>bulk-reader</code> and <code>code-writer</code>. Add your
+  own as markdown files; project modes override user modes, which override built-ins:
+</p>
+<pre><code>&lt;project&gt;/.omp/shunt/modes/&lt;name&gt;.md
+~/.omp/agent/shunt/modes/&lt;name&gt;.md</code></pre>
+<pre><code>---
+model: openai-codex/gpt-6-luna   # optional
+---
+You triage application logs. Answer with timestamps and error codes only.</code></pre>
+<p>Use one by name: <code>bulk_read</code> with <code>mode: "log-triage"</code>. An unknown name fails and lists the available modes.</p>
+
+<h3>Prompt caching</h3>
+<p>
+  Prompt caching is <strong>off</strong> for worker calls. Because the question comes after the files, a follow-up with
+  a new question would never reuse the cached entry, and OpenAI bills cache writes at 1.25× the normal input rate. Leaving
+  caching on would add that premium to every one-shot call and save nothing.
+</p>
+
+<h2 id="when-not">11. When not to delegate</h2>
+<p>Keep these with the main agent:</p>
+<ul>
+  <li><strong>Debugging:</strong> needs exact text and careful reasoning.</li>
+  <li><strong>Editing existing code:</strong> use ranged reads and precise edits.</li>
+  <li><strong>Small files:</strong> the tool call and review cost more than they save.</li>
+  <li><strong>Architecture and design decisions:</strong> need your strongest model.</li>
+  <li><strong>New logic with no file to copy from:</strong> <code>code_write</code> depends on reference files.</li>
+</ul>
+
+<h2 id="limits">12. Limitations</h2>
+<ul>
+  <li>Only <code>read</code> and <code>bash</code> are gated. Reads through the <code>eval</code> tool are not blocked.</li>
+  <li>A ranged read of any size is allowed through, the same as in the original plugin.</li>
+  <li>One worker call is limited by the worker model's context window. Split very large batches.</li>
+  <li>The main agent decides when to use <code>bulk_read</code> and <code>code_write</code>, and it doesn't weigh cost. Ask for them directly, or add standing guidance to an <code>AGENTS.md</code> file.</li>
+</ul>
+
+<footer>
+  shunt for OMP. Adapted from <a href="https://github.com/spotify/portal-ai-plugins/tree/main/plugins/shunt">spotify/portal-ai-plugins</a> (Apache-2.0).
+</footer>
+
+</main>
+</body>
+</html>
